@@ -109,6 +109,12 @@ export function yargsBuilder<
                 conflicts: 'historical',
                 // NOTE: don't set a default for this. It will break apply args from manifest. The default should be set in NodeConfig
               },
+              'finalized-depth': {
+                demandOption: false,
+                describe:
+                  'Number of blocks behind the chain tip to consider as finalized for indexing, overriding native chain finality. Use with caution.',
+                type: 'number',
+              },
               historical: {
                 describe: 'Enable historical state entities, ',
                 type: 'string',
