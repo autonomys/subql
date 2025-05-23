@@ -22,12 +22,15 @@ FROM node:lts-alpine
 COPY --from=builder /app/packages/node/app.tgz /app.tgz
 
 # Install production dependencies
-RUN apk add --no-cache tini curl git && \
+RUN apk add --no-cache tini curl git redis && \
     tar -xzvf /app.tgz --strip 1 && \
     rm /app.tgz && \
     yarn install --production && \
     yarn cache clean && \
     rm -rf /root/.npm /root/.cache
+
+# Copy our local node-core build if it exists
+COPY --from=builder /tmp/node-core-backup/dist /node_modules/@subql/node-core/dist/
 
 # Create ./.monitor directory and set permissions
 RUN mkdir -p .monitor && \
