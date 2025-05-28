@@ -10,6 +10,7 @@ import {
   METADATA_UNFINALIZED_BLOCKS_KEY,
   UnfinalizedBlocksService,
 } from './unfinalizedBlocks.service';
+import { NodeConfig } from '../configure';
 
 /* Notes:
  * Block hashes all have the format '0xabc' + block number
@@ -78,12 +79,13 @@ describe('UnfinalizedBlocksService', () => {
   let unfinalizedBlocksService: UnfinalizedBlocksService;
 
   beforeEach(async () => {
+    const defaultNodeConfig = { unfinalizedBlocks: true, finalizedDepth: undefined } as NodeConfig;
     unfinalizedBlocksService = new UnfinalizedBlocksService(
-      { unfinalizedBlocks: true } as any,
+      defaultNodeConfig,
       mockStoreCache(),
       BlockchainService
     );
-
+    jest.restoreAllMocks();
     await unfinalizedBlocksService.init(() => Promise.resolve());
   });
 
@@ -275,5 +277,365 @@ describe('UnfinalizedBlocksService', () => {
       expect.objectContaining({ blockHash: '0xabc90f', blockHeight: 90, parentHash: '0xabc89f' })
     );
     expect((unfinalizedBlocksService2 as any).lastCheckedBlockHeight).toBe(90);
+  });
+});
+
+// New describe block for finalizedDepth specific tests
+describe('UnfinalizedBlocksService with finalizedDepth', () => {
+  let service: UnfinalizedBlocksService;
+  let mockBlockchainService: jest.Mocked<IBlockchainService>;
+
+  // Helper to create service with specific config and mocked blockchainService
+  // IMPORTANT: This helper now ONLY creates the service instance. Tests must call init().
+  const createServiceInstance = (configOptions: Partial<NodeConfig> = {}) => {
+    const nodeConfig = { 
+      unfinalizedBlocks: true, 
+      finalizedDepth: undefined, 
+      ...configOptions 
+    } as NodeConfig;
+
+    // Create fresh mocks for each test
+    mockBlockchainService = {
+      getFinalizedHeader: jest.fn(),
+      getHeaderForHash: jest.fn(),
+      getHeaderForHeight: jest.fn(),
+      getBestHeight: jest.fn(),
+      // Add other methods from IBlockchainService if they are called and need mocking for these tests
+    } as unknown as jest.Mocked<IBlockchainService>; // Cast needed due to partial mock
+
+    service = new UnfinalizedBlocksService(
+      nodeConfig,
+      mockStoreCache(),
+      mockBlockchainService
+    );
+    // REMOVED: await service.init(() => Promise.resolve());
+    return service; // Return the uninitialized service instance
+  };
+
+  it('Test 1: finalizedDepth active - effective finality is tip - depth', async () => {
+    // Setup
+    const finalizedDepth = 10;
+    const initialTip = 100;
+    const expectedInitialEffectiveFinality = initialTip - finalizedDepth; // 90
+
+    service = createServiceInstance({ finalizedDepth }); // Get instance
+
+    mockBlockchainService.getBestHeight.mockResolvedValue(initialTip);
+    mockBlockchainService.getHeaderForHeight
+      .mockImplementation(async (height: number) => mockBlock(height, `0xabc${height}`).block.header);
+    // Mock actual chain finality to be older, to ensure depth rule takes precedence
+    mockBlockchainService.getFinalizedHeader.mockResolvedValue(mockBlock(50, '0xabc50').block.header);
+
+    await service.init(() => Promise.resolve()); // Test calls init itself
+
+    // Assert initial effective finality
+    expect(mockBlockchainService.getBestHeight).toHaveBeenCalled();
+    expect(mockBlockchainService.getHeaderForHeight).toHaveBeenCalledWith(expectedInitialEffectiveFinality);
+    expect((service as any).effectiveFinalizedHeader.blockHeight).toBe(expectedInitialEffectiveFinality);
+
+    // Action: Simulate a new block processed (tip moves)
+    const newTip = 101;
+    const expectedNewEffectiveFinality = newTip - finalizedDepth; // 91
+    mockBlockchainService.getBestHeight.mockResolvedValue(newTip);
+
+    await service.processUnfinalizedBlockHeader(mockBlock(newTip, `0xabc${newTip}`).block.header);
+
+    // Assert new effective finality
+    // getBestHeight is called in updateEffectiveFinalizedHeader, which is called by processUnfinalizedBlockHeader
+    expect(mockBlockchainService.getHeaderForHeight).toHaveBeenCalledWith(expectedNewEffectiveFinality);
+    expect((service as any).effectiveFinalizedHeader.blockHeight).toBe(expectedNewEffectiveFinality);
+  });
+
+  it('Test 2: finalizedDepth NOT active - effective finality follows chain-reported finality', async () => {
+    service = createServiceInstance({ finalizedDepth: undefined }); // Get instance
+
+    const initialChainFinalized = mockBlock(91, '0xabc91').block.header;
+    mockBlockchainService.getFinalizedHeader.mockResolvedValue(initialChainFinalized);
+    // getBestHeight might be called by updateEffectiveFinalizedHeader, but its result shouldn't dictate finality here
+    mockBlockchainService.getBestHeight.mockResolvedValue(100);
+
+    await service.init(() => Promise.resolve()); // Test calls init itself
+
+    // Effective finality should be the chain-reported one
+    expect((service as any).effectiveFinalizedHeader.blockHeight).toBe(initialChainFinalized.blockHeight);
+    expect((service as any).effectiveFinalizedHeader.blockHash).toBe(initialChainFinalized.blockHash);
+    // getBestHeight might be called once if no candidate from _knownChainFinalizedHeader yet in updateEffectiveFinalizedHeader, then getFinalizedHeader
+    // but getHeaderForHeight for depth calc should NOT be called if finalizedDepth is undefined.
+    expect(mockBlockchainService.getHeaderForHeight).not.toHaveBeenCalledWith(expect.anything());
+
+    // Action: Chain finality advances
+    const newChainFinalized = mockBlock(95, '0xabc95').block.header;
+    mockBlockchainService.getFinalizedHeader.mockResolvedValue(newChainFinalized); // Future calls to getFinalizedHeader return this
+    await service.registerFinalizedBlock(newChainFinalized); // This updates _knownChainFinalizedHeader and calls updateEffectiveFinalizedHeader
+
+    // Assert: Effective finality should update to new chain finality
+    expect((service as any).effectiveFinalizedHeader.blockHeight).toBe(newChainFinalized.blockHeight);
+
+    // Action: Process a new block (advances tip), effective finality should NOT change based on tip
+    mockBlockchainService.getBestHeight.mockResolvedValue(101);
+    await service.processUnfinalizedBlockHeader(mockBlock(101, '0xabc101').block.header);
+    expect((service as any).effectiveFinalizedHeader.blockHeight).toBe(newChainFinalized.blockHeight); // Still 95
+  });
+
+  it('Test 3: finalizedDepth active - pruning of _unfinalizedBlocks', async () => {
+    const finalizedDepth = 5;
+    service = createServiceInstance({ finalizedDepth }); // Get instance
+
+    // Initial setup: tip=95, so effectiveFinalized=90
+    mockBlockchainService.getBestHeight.mockResolvedValue(95);
+    mockBlockchainService.getHeaderForHeight.mockImplementation(async (h: number) => mockBlock(h, `0xabc${h}`).block.header);
+    mockBlockchainService.getFinalizedHeader.mockResolvedValue(mockBlock(50, '0xabc50').block.header); // Chain finality is old
+
+    await service.init(() => Promise.resolve()); // Test calls init itself
+    expect((service as any).effectiveFinalizedHeader.blockHeight).toBe(90);
+
+    // Process blocks 91, 92, 93, 94, 95. 
+    // _effectiveFinalizedHeader will move with each, but _unfinalizedBlocks will accumulate those > current effective.
+    for (let i = 1; i <= 5; i++) {
+      const currentProcessingHeight = 90 + i;
+      mockBlockchainService.getBestHeight.mockResolvedValue(currentProcessingHeight); // Tip is at the block being processed
+      await service.processUnfinalizedBlockHeader(mockBlock(currentProcessingHeight, `0xabc${currentProcessingHeight}`).block.header);
+    }
+    // After processing H95 (tip=95, effective=90): _unfinalizedBlocks = [B91, B92, B93, B94, B95]
+    expect((service as any).unfinalizedBlocks.length).toBe(5);
+    expect((service as any).unfinalizedBlocks.map((b: Header) => b.blockHeight)).toEqual([91, 92, 93, 94, 95]);
+
+    // Action: Advance tip to 98. This should make effective finality 93 (98-5).
+    // When processUnfinalizedBlockHeader is called, it will first call updateEffectiveFinalizedHeader.
+    // Then it will call deleteFinalizedBlock based on the new effective finality.
+    mockBlockchainService.getBestHeight.mockResolvedValue(98);
+    
+    // Call processUnfinalizedBlockHeader with undefined. 
+    // This triggers updateEffectiveFinalizedHeader (setting effective to 93) 
+    // and then the fork check/deleteFinalizedBlock logic which should prune blocks <= 93.
+    await service.processUnfinalizedBlockHeader(undefined); 
+
+    // Assert: Blocks <= 93 should be pruned.
+    // _unfinalizedBlocks should be [B94, B95]
+    let currentUnfinalizedBlocks = (service as any).unfinalizedBlocks as Header[];
+    expect(currentUnfinalizedBlocks.map((b: Header) => b.blockHeight).sort((a,b)=>a-b)).toEqual([94, 95]);
+    expect(currentUnfinalizedBlocks.length).toBe(2);
+
+    // Further check: Now, sequentially add blocks 96, 97, 98 to ensure list remains consistent
+    // Tip is still 98, effective finality is 93. Last unfinalized is 95.
+    mockBlockchainService.getBestHeight.mockResolvedValue(98); // Keep tip at 98 for these additions
+    await service.processUnfinalizedBlockHeader(mockBlock(96, '0xabc96').block.header);
+    currentUnfinalizedBlocks = (service as any).unfinalizedBlocks as Header[];
+    expect(currentUnfinalizedBlocks.map((b: Header) => b.blockHeight).sort((a,b)=>a-b)).toEqual([94, 95, 96]);
+    
+    // Tip could advance here or stay, let's assume it advances with each block for this part of test
+    mockBlockchainService.getBestHeight.mockResolvedValue(99); // Tip is now 99, effective is 94
+    await service.processUnfinalizedBlockHeader(mockBlock(97, '0xabc97').block.header);
+    currentUnfinalizedBlocks = (service as any).unfinalizedBlocks as Header[];
+    expect(currentUnfinalizedBlocks.map((b: Header) => b.blockHeight).sort((a,b)=>a-b)).toEqual([95, 96, 97]); // 94 got pruned
+
+    mockBlockchainService.getBestHeight.mockResolvedValue(100); // Tip is now 100, effective is 95
+    await service.processUnfinalizedBlockHeader(mockBlock(98, '0xabc98').block.header);
+    currentUnfinalizedBlocks = (service as any).unfinalizedBlocks as Header[];
+    expect(currentUnfinalizedBlocks.map((b: Header) => b.blockHeight).sort((a,b)=>a-b)).toEqual([96, 97, 98]); // 95 got pruned
+  });
+
+  it('Test 4: finalizedDepth active - depth calculation fails, falls back to chain finality', async () => {
+    const finalizedDepth = 10;
+    service = createServiceInstance({ finalizedDepth }); // Get instance
+
+    // Create our mocks BEFORE init
+    const chainFinalized = mockBlock(80, '0xabc80').block.header;
+    
+    // Make sure chainFinalized has all required properties of a Header
+    console.log('Debug - chainFinalized header:', {
+      blockHeight: chainFinalized.blockHeight,
+      blockHash: chainFinalized.blockHash,
+      parentHash: chainFinalized.parentHash,
+      hasTimestamp: !!chainFinalized.timestamp
+    });
+    
+    // Explicitly ensure getBestHeight fails with a rejection
+    mockBlockchainService.getBestHeight.mockRejectedValue(new Error('RPC down!'));
+    
+    // Ensure getFinalizedHeader returns a complete valid header
+    mockBlockchainService.getFinalizedHeader.mockResolvedValue({
+      blockHeight: 80,
+      blockHash: '0xabc80',
+      parentHash: '0xabc79',
+      timestamp: new Date()  // Ensure timestamp is explicitly included
+    });
+
+    // Now call init with our mocks in place
+    await service.init(() => Promise.resolve());
+    
+    // Directly check internal state after init
+    console.log('Debug - After init - Service state:', {
+      knownChainFinalizedHeader: (service as any)._knownChainFinalizedHeader?.blockHeight,
+      effectiveFinalizedHeader: (service as any)._effectiveFinalizedHeader?.blockHeight,
+      finalizedDepth: (service as any).nodeConfig.finalizedDepth
+    });
+
+    // Verify expected behavior
+    expect(mockBlockchainService.getBestHeight).toHaveBeenCalled();
+    expect(mockBlockchainService.getFinalizedHeader).toHaveBeenCalled();
+    
+    // Access the protected property directly for debugging
+    const effectiveHeader = (service as any)._effectiveFinalizedHeader;
+    if (!effectiveHeader) {
+      console.error('FAILURE - _effectiveFinalizedHeader is undefined after init!');
+    } else {
+      console.log('Debug - effectiveHeader:', {
+        blockHeight: effectiveHeader.blockHeight,
+        blockHash: effectiveHeader.blockHash
+      });
+    }
+    
+    // Test should pass if the fallback to chain finality worked
+    expect(effectiveHeader).toBeDefined();
+    expect(effectiveHeader.blockHeight).toBe(80);
+    
+    // Original assertion - only try if effectiveHeader exists
+    if (effectiveHeader) {
+      expect((service as any).effectiveFinalizedHeader.blockHeight).toBe(80);
+    }
+
+    // --- Further test: depth calc fails, initial chain finality fetch fails, subsequent fetch succeeds ---
+    console.log('\nDebug - Test 4 - Starting second part (resilience test)');
+    // Reset internal states to simulate a fresh scenario where these are not yet known
+    (service as any)._knownChainFinalizedHeader = undefined;
+    (service as any)._effectiveFinalizedHeader = undefined; 
+
+    // Mock getBestHeight to continue failing (for depth calculation)
+    mockBlockchainService.getBestHeight.mockRejectedValue(new Error('RPC down for resilience test part!'));
+    
+    let finalizeCallCount = 0;
+    mockBlockchainService.getFinalizedHeader.mockImplementation(async () => {
+      finalizeCallCount++;
+      console.log(`Debug - Test 4 (resilience) - getFinalizedHeader called, count: ${finalizeCallCount}`);
+      if (finalizeCallCount === 1) {
+        console.log('Debug - Test 4 (resilience) - getFinalizedHeader: Simulating first call failure');
+        throw new Error('Chain finality RPC temporarily down for resilience test');
+      }
+      console.log('Debug - Test 4 (resilience) - getFinalizedHeader: Simulating second call success (H85)');
+      // Ensure a complete Header object is returned
+      return { blockHeight: 85, blockHash: '0xabc85', parentHash: '0xabc84', timestamp: new Date() }; 
+    });
+    
+    // First attempt to update effective finality: 
+    // Depth calc will fail (getBestHeight rejects).
+    // _knownChainFinalizedHeader is undefined.
+    // Fallback getFinalizedHeader() will be called (finalizeCallCount becomes 1) and will throw an error.
+    // So, _effectiveFinalizedHeader should remain undefined.
+    await (service as any).updateEffectiveFinalizedHeader();
+    console.log(`Debug - Test 4 (resilience) - After 1st updateEffectiveFinalizedHeader call: _effectiveFinalizedHeader is ${(service as any)._effectiveFinalizedHeader?.blockHeight}`);
+    expect((service as any)._effectiveFinalizedHeader).toBeUndefined(); 
+    expect(finalizeCallCount).toBe(1); // getFinalizedHeader was called once and failed
+
+    // Second attempt to update effective finality:
+    // Depth calc will fail again.
+    // _knownChainFinalizedHeader is still undefined.
+    // Fallback getFinalizedHeader() will be called again (finalizeCallCount becomes 2) and will succeed, returning H85.
+    // So, _effectiveFinalizedHeader should now be H85.
+    await (service as any).updateEffectiveFinalizedHeader();
+    console.log(`Debug - Test 4 (resilience) - After 2nd updateEffectiveFinalizedHeader call: _effectiveFinalizedHeader is ${(service as any)._effectiveFinalizedHeader?.blockHeight}`);
+    
+    expect((service as any)._effectiveFinalizedHeader).toBeDefined();
+    expect((service as any).effectiveFinalizedHeader.blockHeight).toBe(85); // Now it should be set
+    expect(finalizeCallCount).toBe(2); // getFinalizedHeader was called again and succeeded
+  });
+
+  it('Test 5: finalizedDepth active - fork detected based on effective finality', async () => {
+    // Setup
+    const finalizedDepth = 10;
+    const initialTip = 100; // So initial effectiveFinalized is 90
+    const forkPointHeight = 90;
+    const firstUnfinalizedHeight = forkPointHeight + 1; // 91
+
+    service = createServiceInstance({ finalizedDepth }); // Get instance
+
+    // ---- Initial state setup ----
+    // Mock chain's actual finality to be much older
+    mockBlockchainService.getFinalizedHeader.mockResolvedValue(mockBlock(50, '0xabc50').block.header);
+    // Mock best height for initial calculation
+    mockBlockchainService.getBestHeight.mockResolvedValue(initialTip);
+    // Mock getHeaderForHeight to return canonical blocks initially
+    mockBlockchainService.getHeaderForHeight.mockImplementation(async (height: number) => {
+      return mockBlock(height, `0xabc${height}_canonical`, `0xabc${height - 1}_canonical`).block.header;
+    });
+    // Mock getHeaderForHash for parent lookups during fork processing
+    mockBlockchainService.getHeaderForHash.mockImplementation(async (hash: string) => {
+      if (hash === '0xabc90_canonical') { // Parent of 91f and 91_canonical
+        return mockBlock(forkPointHeight, '0xabc90_canonical').block.header;
+      }
+      // Add other specific hash lookups if needed for more complex fork scenarios
+      const height = parseInt(hash.replace('0xabc', '').replace('_canonical', '').replace('f', ''), 10);
+      if (!isNaN(height)) {
+        return mockBlock(height, hash).block.header;
+      }
+      throw new Error(`Mock getHeaderForHash not implemented for ${hash}`);
+    });
+
+    await service.init(() => Promise.resolve()); // Effective finality becomes H90 (100-10)
+    expect((service as any).effectiveFinalizedHeader.blockHeight).toBe(forkPointHeight);
+    expect((service as any).effectiveFinalizedHeader.blockHash).toBe('0xabc90_canonical');
+
+    // ---- Process some blocks that are initially considered canonical by our node ----
+    // Tip moves as we process, affecting subsequent effective finality calc for that call
+    mockBlockchainService.getBestHeight.mockResolvedValue(firstUnfinalizedHeight); // Tip is now 91
+    await service.processUnfinalizedBlockHeader(mockBlock(firstUnfinalizedHeight, '0xabc91_canonical', '0xabc90_canonical').block.header);
+    // After processing 91: effective finality = 91-10 = 81. _unfinalizedBlocks = [H91can]
+    
+    mockBlockchainService.getBestHeight.mockResolvedValue(firstUnfinalizedHeight + 1); // Tip is now 92
+    await service.processUnfinalizedBlockHeader(mockBlock(firstUnfinalizedHeight + 1, '0xabc92_canonical', '0xabc91_canonical').block.header);
+    // After processing 92: effective finality = 92-10 = 82. _unfinalizedBlocks = [H91can, H92can]
+    expect((service as any).unfinalizedBlocks.length).toBe(2);
+    expect((service as any).unfinalizedBlocks[0].blockHash).toBe('0xabc91_canonical');
+
+    // ---- Introduce the fork ----
+    // The *true* chain tip (from blockchainService.getBestHeight) advances, and the header for height 91 is now different (forked)
+    mockBlockchainService.getBestHeight.mockResolvedValue(firstUnfinalizedHeight + 2); // e.g., tip is 93
+    
+    // Crucially, when updateEffectiveFinalizedHeader runs, it will use getBestHeight (93),
+    // calculate target as 93-10=83. Then it calls getHeaderForHeight(83).
+    // The fork information comes when hasForked tries to validate block 91c against a potentially forked chain view.
+    // Let's make getHeaderForHeight return the forked block when asked for height 91
+    const forkedBlock91 = mockBlock(firstUnfinalizedHeight, '0xabc91_forked', '0xabc90_canonical').block.header; 
+    mockBlockchainService.getHeaderForHeight.mockImplementation(async (height: number) => {
+      if (height === firstUnfinalizedHeight) return forkedBlock91;
+      return mockBlock(height, `0xabc${height}_canonical`, `0xabc${height-1}_canonical`).block.header;
+    });
+
+    // Also, let's say the actual *chain reported finality* jumps to this forked block
+    // This will directly set _knownChainFinalizedHeader to the forked block
+    // and then updateEffectiveFinalizedHeader will run. If depth is active, it'll try tip-depth first.
+    // If tip-depth (e.g. 83) is older than the forked block (91f), then 91f (if it became _knownChainFinalizedHeader) could become _effective.
+    // This part is tricky. The easiest way to inject the fork for `hasForked` is for `_effectiveFinalizedHeader` to become the forked block.
+
+    // Let's simulate that _effectiveFinalizedHeader becomes the forked version of H91
+    // This happens if the `updateEffectiveFinalizedHeader` logic, using `getBestHeight()` and then `getHeaderForHeight(tip-depth)`,
+    // ends up fetching `forkedBlock91` because `tip-depth` resolved to `firstUnfinalizedHeight` (91).
+    const newTipForFork = finalizedDepth + firstUnfinalizedHeight; // e.g., 10 + 91 = 101. So 101-10 = 91.
+    mockBlockchainService.getBestHeight.mockResolvedValue(newTipForFork); 
+    // getHeaderForHeight for 91 is already mocked to return forkedBlock91.
+
+    // Now, process a new block (e.g. 93). This will trigger updateEffectiveFinalizedHeader first.
+    // updateEffectiveFinalizedHeader: best=101, target=91. getHeaderForHeight(91) -> forkedBlock91.
+    // So, _effectiveFinalizedHeader becomes forkedBlock91.
+    const result = await service.processUnfinalizedBlockHeader(mockBlock(firstUnfinalizedHeight + 2, '0xabc93_after_fork', 'some_parent').block.header);
+
+    // ---- Assertions ----
+    // hasForked should have been called. It compares _unfinalizedBlocks (which has 0xabc91_canonical)
+    // with _effectiveFinalizedHeader (which is now 0xabc91_forked).
+    // It should detect a fork at height 91.
+    // getLastCorrectFinalizedBlock should then be called with forkedBlock91.
+    // It should trace back from forkedBlock91 (parent 0xabc90_canonical) and see that 0xabc90_canonical matches our _unfinalizedBlocks history (or is the block before it).
+    // Actually, _unfinalizedBlocks was [H91can, H92can]. lastVerifiableBlock for H91f would be H91can.
+    // Their hashes differ. Fork detected. Returns H91f.
+    // getLastCorrectFinalizedBlock(H91f) is called.
+    // It iterates _unfinalizedBlocks in reverse: [H92can, H91can].
+    //   - checkingHeader = H91f. Compare with H92can -> no match. parentHash of H92can is H91can.
+    //     New checkingHeader becomes H91can (parent of H92can, by walking up chain from H91f via its parent H90can... this part is tricky)
+    //   The logic is: for (const bestHeader of bestVerifiableBlocks.reverse()) { if (bestHeader.blockHash === checkingHeader.blockHash || bestHeader.blockHash === checkingHeader.parentHash) return bestHeader }
+    // Let's simplify: the rewind should be to the common ancestor, which is H90_canonical.
+
+    expect(result).toBeDefined();
+    expect(result?.blockHeight).toBe(forkPointHeight); // Should rewind to 90
+    expect(result?.blockHash).toBe('0xabc90_canonical'); // The parent of the fork
   });
 });

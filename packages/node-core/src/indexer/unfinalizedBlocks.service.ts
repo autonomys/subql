@@ -42,7 +42,8 @@ export interface IUnfinalizedBlocksServiceUtil {
 @Injectable()
 export class UnfinalizedBlocksService<B = any> implements IUnfinalizedBlocksService<B> {
   private _unfinalizedBlocks?: UnfinalizedBlocks;
-  private _finalizedHeader?: Header;
+  private _knownChainFinalizedHeader?: Header; // Stores the latest *actual* chain-reported finalized header
+  private _effectiveFinalizedHeader?: Header; // The header this service uses based on config
   protected lastCheckedBlockHeight?: number;
 
   @mainThreadOnly()
@@ -55,9 +56,9 @@ export class UnfinalizedBlocksService<B = any> implements IUnfinalizedBlocksServ
     return this._unfinalizedBlocks;
   }
 
-  protected get finalizedHeader(): Header {
-    assert(this._finalizedHeader !== undefined, new Error('Unfinalized blocks service has not been initialized'));
-    return this._finalizedHeader;
+  protected get effectiveFinalizedHeader(): Header {
+    assert(this._effectiveFinalizedHeader !== undefined, 'Effective finalized header has not been initialized. Ensure updateEffectiveFinalizedHeader is called.');
+    return this._effectiveFinalizedHeader;
   }
 
   constructor(
@@ -67,13 +68,34 @@ export class UnfinalizedBlocksService<B = any> implements IUnfinalizedBlocksServ
   ) {}
 
   async init(reindex: (tagetHeader: Header) => Promise<void>): Promise<Header | undefined> {
-    logger.info(`Unfinalized blocks is ${this.nodeConfig.unfinalizedBlocks ? 'enabled' : 'disabled'}`);
+    logger.info(`Unfinalized blocks feature is ${this.nodeConfig.unfinalizedBlocks ? 'enabled' : 'disabled'}.`);
+    if (this.nodeConfig.finalizedDepth !== undefined && this.nodeConfig.finalizedDepth > 0) {
+      logger.info(`Using custom finalized depth: ${this.nodeConfig.finalizedDepth} blocks.`);
+    } else {
+      logger.info('Using chain-reported finality.');
+    }
 
     this._unfinalizedBlocks = await this.getMetadataUnfinalizedBlocks();
     this.lastCheckedBlockHeight = await this.getLastFinalizedVerifiedHeight();
-    this._finalizedHeader = await this.blockchainService.getFinalizedHeader();
+    
+    // Fetch initial known chain finality
+    try {
+      this._knownChainFinalizedHeader = await this.blockchainService.getFinalizedHeader();
+    } catch (e) {
+      logger.warn({err: e}, 'Failed to fetch initial chain finalized header during init.');
+      // _knownChainFinalizedHeader remains undefined, updateEffectiveFinalizedHeader will handle it
+    }
+    
+    await this.updateEffectiveFinalizedHeader(); // Set initial effective finality
 
-    if (this.unfinalizedBlocks.length) {
+    if (!this._effectiveFinalizedHeader) {
+      // This might happen if the chain has no finalized blocks yet and depth calculation also fails or isn't applicable.
+      // It indicates an issue or a very early chain state. The service might not function correctly without a baseline.
+      logger.warn('Could not determine an initial effective finalized header. Service may be impaired until finality is established.');
+      // Depending on requirements, could throw, or allow to proceed and hope it resolves.
+    }
+
+    if (this.unfinalizedBlocks.length && this._effectiveFinalizedHeader) { // Check _effectiveFinalizedHeader exists
       logger.info('Processing unfinalized blocks');
       // Validate any previously unfinalized blocks
 
@@ -93,12 +115,81 @@ export class UnfinalizedBlocksService<B = any> implements IUnfinalizedBlocksServ
   }
 
   private get finalizedBlockNumber(): number {
-    return this.finalizedHeader.blockHeight;
+    // If _effectiveFinalizedHeader is not set (e.g. chain has no finality yet), 
+    // this could throw due to the assert in the getter, or we might return a sensible default like 0 or -1.
+    // For now, relying on the assert to catch uninitialized state.
+    return this.effectiveFinalizedHeader.blockHeight;
+  }
+
+  private async updateEffectiveFinalizedHeader(): Promise<void> {
+    let newCandidateHeader: Header | undefined;
+    const useCustomDepth = this.nodeConfig.finalizedDepth !== undefined && this.nodeConfig.finalizedDepth > 0;
+
+    if (useCustomDepth) {
+      try {
+        const bestHeight = await this.blockchainService.getBestHeight();
+        const targetHeight = Math.max(0, bestHeight - (this.nodeConfig.finalizedDepth as number)); // Cast as it's checked
+        newCandidateHeader = await this.blockchainService.getHeaderForHeight(targetHeight);
+        logger.debug(`Depth rule: Effective finality candidate ${newCandidateHeader.blockHeight} (Tip: ${bestHeight})`);
+      } catch (e) {
+        logger.warn({err: e}, `Failed to calculate effective finality using depth. Will use chain finality if available.`);
+        // Fallback to known chain finality if depth calculation fails
+        if (this._knownChainFinalizedHeader) {
+          newCandidateHeader = this._knownChainFinalizedHeader;
+          logger.debug('Depth rule failed, falling back to known chain finality for effective: ' + newCandidateHeader.blockHeight);
+        } else {
+            logger.warn('Depth rule failed, and no known chain finality to fall back to.');
+        }
+      }
+    } else {
+      // Not using custom depth, so effective finality is chain finality
+      if (this._knownChainFinalizedHeader) {
+        newCandidateHeader = this._knownChainFinalizedHeader;
+        logger.debug('Chain rule: Effective finality is known chain finality: ' + newCandidateHeader.blockHeight);
+      }
+      // If _knownChainFinalizedHeader is also undefined (e.g. very first call in init before it's fetched),
+      // newCandidateHeader remains undefined. The next block handles this.
+    }
+
+    // If no candidate yet (e.g. not using depth and _knownChainFinalizedHeader was not set), try to fetch current chain finality.
+    if (!newCandidateHeader) {
+        try {
+            const currentChainFinalized = await this.blockchainService.getFinalizedHeader();
+            if (currentChainFinalized) {
+                newCandidateHeader = currentChainFinalized;
+                this._knownChainFinalizedHeader = currentChainFinalized; // Update our known copy
+                logger.debug('Fetched current chain finality for effective: ' + newCandidateHeader.blockHeight);
+            }
+        } catch (e) {
+            logger.warn({err: e}, 'Failed to fetch current chain finalized header during effective update.');
+        }
+    }
+
+    if (newCandidateHeader) {
+      if (!this._effectiveFinalizedHeader || 
+          newCandidateHeader.blockHeight > this._effectiveFinalizedHeader.blockHeight || 
+          (newCandidateHeader.blockHeight === this._effectiveFinalizedHeader.blockHeight && newCandidateHeader.blockHash !== this._effectiveFinalizedHeader.blockHash)) {
+        this._effectiveFinalizedHeader = newCandidateHeader;
+        logger.info(`Effective finalized header updated to: ${this._effectiveFinalizedHeader.blockHeight} (Hash: ${this._effectiveFinalizedHeader.blockHash})`);
+      }
+    } else {
+      // Only log if it was previously set, to avoid spamming if chain truly has no finality yet.
+      if (this._effectiveFinalizedHeader) {
+        logger.warn('Could not determine a new effective finalized header. Previous value retained if any.');
+      }
+    }
   }
 
   async processUnfinalizedBlockHeader(header?: Header): Promise<Header | undefined> {
     if (header) {
-      await this.registerUnfinalizedBlock(header);
+      await this.registerUnfinalizedBlock(header); // Add to our list if newer than current effectiveFinalizedNumber
+    }
+
+    await this.updateEffectiveFinalizedHeader(); // Recalculate effective finality based on new tip or chain state
+
+    if (!this._effectiveFinalizedHeader) {
+      logger.warn('No effective finalized header set; cannot process forks or delete finalized blocks.');
+      return undefined; // Cannot proceed without a notion of finality
     }
 
     const forkedHeader = await this.hasForked();
@@ -110,23 +201,45 @@ export class UnfinalizedBlocksService<B = any> implements IUnfinalizedBlocksServ
       // Get the last unfinalized block that is now finalized
       return this.getLastCorrectFinalizedBlock(forkedHeader);
     }
-
-    return;
+    return undefined;
   }
 
   async processUnfinalizedBlocks(block?: IBlock<B>): Promise<Header | undefined> {
     return this.processUnfinalizedBlockHeader(block ? this.blockToHeader(block) : undefined);
   }
 
-  registerFinalizedBlock(header: Header): void {
-    if (this.finalizedHeader && this.finalizedBlockNumber >= header.blockHeight) {
-      return;
+  // This method is called by FetchService when a new block is *actually* finalized on chain
+  async registerFinalizedBlock(chainReportedFinalizedHeader: Header): Promise<void> {
+    let chainFinalityUpdated = false;
+    if (!this._knownChainFinalizedHeader || chainReportedFinalizedHeader.blockHeight > this._knownChainFinalizedHeader.blockHeight) {
+      this._knownChainFinalizedHeader = chainReportedFinalizedHeader;
+      chainFinalityUpdated = true;
+      logger.debug(`Known chain-reported finalized header updated to: ${this._knownChainFinalizedHeader.blockHeight}`);
     }
-    this._finalizedHeader = header;
+
+    // Re-evaluate effective finality. This is important if not using depth, or as a fallback for depth.
+    // If using depth, it will recalculate based on tip. If not, it will use the new _knownChainFinalizedHeader.
+    await this.updateEffectiveFinalizedHeader();
+    
+    // If effective finality changed, it might be possible to prune unfinalized blocks
+    // The call in processUnfinalizedBlockHeader might be sufficient, but an explicit call here can be considered
+    // if registerFinalizedBlock can be called independently of processUnfinalizedBlockHeader in some paths.
+    // For now, relying on processUnfinalizedBlockHeader to handle pruning after its own updateEffectiveFinalizedHeader call.
+    if (chainFinalityUpdated && this._effectiveFinalizedHeader) {
+        // Potentially trigger pruning if chain finality directly led to effective finality changing and we are not using depth primarily.
+        // This is implicitly handled as updateEffectiveFinalizedHeader -> processUnfinalizedBlockHeader -> deleteFinalizedBlock.
+    }
   }
 
   private async registerUnfinalizedBlock(header: Header): Promise<void> {
-    if (header.blockHeight <= this.finalizedBlockNumber) return;
+    // Ensure _effectiveFinalizedHeader is available before checking finalizedBlockNumber
+    if (!this._effectiveFinalizedHeader) {
+        logger.warn(`Cannot register unfinalized block ${header.blockHeight}; effective finality not yet determined.`);
+        // Decide: throw, or queue, or drop? For now, let it pass and fail at the next check if still undefined.
+        // Or, better, ensure init sequence always establishes some _effectiveFinalizedHeader if possible.
+    }
+    // finalizedBlockNumber getter will assert if _effectiveFinalizedHeader is undefined.
+    if (this._effectiveFinalizedHeader && header.blockHeight <= this.finalizedBlockNumber) return;
 
     // Ensure order
     const lastUnfinalizedHeight = last(this.unfinalizedBlocks)?.blockHeight;
@@ -165,6 +278,11 @@ export class UnfinalizedBlocksService<B = any> implements IUnfinalizedBlocksServ
 
   // check unfinalized blocks for a fork, returns the header where a fork happened
   protected async hasForked(): Promise<Header | undefined> {
+    // Ensure _effectiveFinalizedHeader is available before proceeding
+    if (!this._effectiveFinalizedHeader) {
+        logger.warn('Cannot check for forks; effective finality not yet determined.');
+        return undefined;
+    }
     const lastVerifiableBlock = this.getClosestRecord(this.finalizedBlockNumber);
 
     // No unfinalized blocks
@@ -174,15 +292,15 @@ export class UnfinalizedBlocksService<B = any> implements IUnfinalizedBlocksServ
 
     // Unfinalized blocks beyond finalized block
     if (lastVerifiableBlock.blockHeight === this.finalizedBlockNumber) {
-      if (lastVerifiableBlock.blockHash !== this.finalizedHeader.blockHash) {
+      if (lastVerifiableBlock.blockHash !== this._effectiveFinalizedHeader.blockHash) {
         logger.warn(
-          `Block fork found, enqueued un-finalized block at ${lastVerifiableBlock.blockHeight} with hash ${lastVerifiableBlock.blockHash}, actual hash is ${this.finalizedHeader.blockHash}.`
+          `Block fork found, enqueued un-finalized block at ${lastVerifiableBlock.blockHeight} with hash ${lastVerifiableBlock.blockHash}, actual hash is ${this._effectiveFinalizedHeader.blockHash}.`
         );
-        return this.finalizedHeader;
+        return this._effectiveFinalizedHeader;
       }
     } else {
       // Unfinalized blocks below finalized block
-      let header = this.finalizedHeader;
+      let header = this._effectiveFinalizedHeader;
       /*
        * Iterate back through parent hashes until we get the header with the matching height
        * We use headers here rather than getBlockHash because of potential caching issues on the rpc
