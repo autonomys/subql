@@ -385,7 +385,7 @@ export async function fetchEventsRange(
         try {
           const events = await api.query.system.events.at(hash);
           if (events && events.length > 0) {
-            console.log(`[DEBUG] Block ${blockNumber}: Found ${events.length} events using standard query`);
+            // console.log(`[DEBUG] Block ${blockNumber}: Found ${events.length} events using standard query`);
             return events;
           }
         } catch (standardErr) {
@@ -403,7 +403,7 @@ export async function fetchEventsRange(
           const eventCount = totalEventCount && totalEventCount.toNumber ? totalEventCount.toNumber() : 0;
           
           if (eventCount > 0) {
-            console.log(`[DEBUG] Block ${blockNumber} has ${eventCount} events (using segmented approach)`);
+            // console.log(`[DEBUG] Block ${blockNumber} has ${eventCount} events (using segmented approach)`);
             
             // Calculate number of segments to check (EventSegmentSize = 100)
             const SEGMENT_SIZE = 100;
