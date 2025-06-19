@@ -562,15 +562,11 @@ async function batchDeleteAndThenUpdate(
                 limit: batchSize,
                 hooks: false,
                 where: {
-                  [Op.and]: [
-                    {
-                      __block_range: {
-                        [Op.contains]: targetBlockUnit,
-                      },
-                    },
-                    sequelize.where(sequelize.fn('upper', sequelize.col('_block_range')), Op.not, null),
-                  ],
-                },
+                [Op.and]: [
+                  sequelize.where(sequelize.fn('upper', sequelize.col('_block_range')), Op.gt, targetBlockUnit),
+                  sequelize.where(sequelize.fn('upper', sequelize.col('_block_range')), Op.not, null),
+                ],
+              },
               }
             ),
       ]);
