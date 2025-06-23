@@ -15,6 +15,7 @@ import {PoiService, PoiSyncService} from './poi';
 import {SandboxService} from './sandbox.service';
 import {StoreService} from './store.service';
 import {storeModelFactory} from './storeModelProvider';
+import {RedisService} from './redis.service';
 
 @Module({
   providers: [
@@ -28,6 +29,7 @@ import {storeModelFactory} from './storeModelProvider';
     PoiService,
     PoiSyncService,
     StoreService,
+    RedisService,
     {
       provide: 'IStoreModelProvider',
       useFactory: storeModelFactory,
@@ -46,6 +48,7 @@ import {storeModelFactory} from './storeModelProvider';
     StoreService,
     'IStoreModelProvider',
     InMemoryCacheService,
+    RedisService,
   ],
 })
 export class CoreModule {}

@@ -12,12 +12,14 @@ import {NodeVM, NodeVMOptions, VMError, VMScript} from 'vm2';
 import {NodeConfig} from '../configure/NodeConfig';
 import {getLogger} from '../logger';
 import {timeout} from '../utils/promise';
+import {SafeRedisClient} from './redis.service';
 
 export const SANDBOX_DEFAULT_BUILTINS = ['assert', 'buffer', 'crypto', 'util', 'path', 'url', 'stream'];
 
 export interface SandboxOption {
   cache?: Cache;
   store?: Store;
+  redis?: SafeRedisClient;
   root: string;
   entry: string;
   chainId: string;
@@ -184,13 +186,15 @@ export class IndexerSandbox extends Sandbox {
     }
   }
 
-  private injectGlobals({cache, store}: SandboxOption) {
+  private injectGlobals({cache, store, redis}: SandboxOption) {
     if (store) {
       this.freeze(store, 'store');
     }
     if (cache) {
       this.freeze(cache, 'cache');
     }
+    // Always inject redis, even if undefined
+    this.freeze(redis, 'redis');
     this.freeze(logger, 'logger');
   }
 }

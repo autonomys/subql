@@ -26,3 +26,4 @@ export * from './unfinalizedBlocks.service';
 export * from './monitor.service';
 export * from './multiChainRewind.service';
 export * from './core.module';
+export * from './redis.service';

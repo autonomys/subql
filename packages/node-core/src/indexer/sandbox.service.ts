@@ -10,6 +10,7 @@ import {IndexerSandbox} from './sandbox';
 import {StoreService} from './store.service';
 import {ISubqueryProject} from './types';
 import {hostStoreToStore} from './worker';
+import {RedisService} from './redis.service';
 
 /* It would be nice to move this to node core but need to find a way to inject other things into the sandbox */
 @Injectable()
@@ -21,7 +22,8 @@ export class SandboxService<Api, UnsafeApi> {
     private readonly storeService: StoreService,
     private readonly cacheService: InMemoryCacheService,
     private readonly nodeConfig: NodeConfig,
-    @Inject('ISubqueryProject') private readonly project: ISubqueryProject
+    @Inject('ISubqueryProject') private readonly project: ISubqueryProject,
+    private readonly redisService: RedisService
   ) {}
 
   getDsProcessor(
@@ -33,6 +35,7 @@ export class SandboxService<Api, UnsafeApi> {
     const store: Store = isMainThread ? this.storeService.getStore() : hostStoreToStore((global as any).host); // Provided in worker.ts
 
     const cache = this.cacheService.getCache();
+    const redis = this.redisService.getSafeClient();
     const entry = this.getDataSourceEntry(ds);
     let processor = this.processorCache[entry];
     if (!processor) {
@@ -40,6 +43,7 @@ export class SandboxService<Api, UnsafeApi> {
         {
           cache,
           store,
+          redis,
           root: this.project.root,
           entry,
           chainId: this.project.network.chainId,
@@ -48,6 +52,10 @@ export class SandboxService<Api, UnsafeApi> {
       );
       this.processorCache[entry] = processor;
     }
+    
+    // Always update Redis client as it may have connected after sandbox creation
+    processor.freeze(redis, 'redis');
+    
     // Run this before injecting other values so they cannot be overwritten
     for (const [key, value] of Object.entries(extraInjections)) {
       processor.freeze(value, key);
