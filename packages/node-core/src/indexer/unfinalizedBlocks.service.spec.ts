@@ -639,3 +639,226 @@ describe('UnfinalizedBlocksService with finalizedDepth', () => {
     expect(result?.blockHash).toBe('0xabc90_canonical'); // The parent of the fork
   });
 });
+
+// New describe block for comprehensive fork detection tests
+describe('UnfinalizedBlocksService with comprehensiveForkDetection', () => {
+  let service: UnfinalizedBlocksService;
+  let mockBlockchainService: jest.Mocked<IBlockchainService>;
+
+  const createServiceWithComprehensiveCheck = async (
+    comprehensiveForkDetection: boolean = true,
+    finalizedDepth: number = 10
+  ) => {
+    const nodeConfig = { 
+      unfinalizedBlocks: true, 
+      finalizedDepth,
+      comprehensiveForkDetection,
+    } as NodeConfig;
+
+    mockBlockchainService = {
+      getFinalizedHeader: jest.fn(),
+      getHeaderForHash: jest.fn(),
+      getHeaderForHeight: jest.fn(),
+      getBestHeight: jest.fn(),
+    } as unknown as jest.Mocked<IBlockchainService>;
+
+    service = new UnfinalizedBlocksService(
+      nodeConfig,
+      mockStoreCache(),
+      mockBlockchainService
+    );
+
+    // Setup default mocks
+    mockBlockchainService.getBestHeight.mockResolvedValue(100);
+    mockBlockchainService.getFinalizedHeader.mockResolvedValue(mockBlock(50, '0xabc50').block.header);
+    
+    // Mock getHeaderForHash for parent hash lookups
+    mockBlockchainService.getHeaderForHash.mockImplementation(async (hash: string) => {
+      const num = parseInt(hash.replace('0xabc', '').replace('_canonical', '').replace('_orphan', ''), 10);
+      if (!isNaN(num)) {
+        return mockBlock(num, hash, `0xabc${num - 1}`).block.header;
+      }
+      throw new Error(`Mock getHeaderForHash not implemented for ${hash}`);
+    });
+    
+    await service.init(() => Promise.resolve());
+    return service;
+  };
+
+  it('should detect multiple orphan blocks and return the deepest fork', async () => {
+    // Create service with comprehensive check enabled
+    service = await createServiceWithComprehensiveCheck(true, 10);
+    
+    // Setup: current tip is 115, so finalized = 105
+    mockBlockchainService.getBestHeight.mockResolvedValue(100);
+    
+    // Mock the chain's view of blocks
+    mockBlockchainService.getHeaderForHeight.mockImplementation(async (height: number) => {
+      // Simulate orphan blocks at heights 101 and 103
+      if (height === 101) {
+        return mockBlock(101, '0xabc101_canonical', '0xabc100').block.header;
+      }
+      if (height === 103) {
+        return mockBlock(103, '0xabc103_canonical', '0xabc102').block.header;
+      }
+      return mockBlock(height, `0xabc${height}`, `0xabc${height - 1}`).block.header;
+    });
+
+    // Process blocks including the orphans
+    // Add blocks to unfinalized list (some are orphans)
+    await service.processUnfinalizedBlockHeader(mockBlock(100, '0xabc100').block.header);
+    await service.processUnfinalizedBlockHeader(mockBlock(101, '0xabc101_orphan', '0xabc100').block.header); // Orphan!
+    await service.processUnfinalizedBlockHeader(mockBlock(102, '0xabc102').block.header);
+    await service.processUnfinalizedBlockHeader(mockBlock(103, '0xabc103_orphan', '0xabc102').block.header); // Orphan!
+    await service.processUnfinalizedBlockHeader(mockBlock(104, '0xabc104').block.header);
+    await service.processUnfinalizedBlockHeader(mockBlock(105, '0xabc105').block.header);
+    
+    // Process blocks sequentially to advance tip
+    for (let i = 106; i <= 115; i++) {
+      mockBlockchainService.getBestHeight.mockResolvedValue(i);
+      await service.processUnfinalizedBlockHeader(mockBlock(i, `0xabc${i}`, `0xabc${i-1}`).block.header);
+    }
+
+    // Now trigger fork detection with finalized at 105 (tip 115 - depth 10)
+    mockBlockchainService.getBestHeight.mockResolvedValue(115);
+    const forkedHeader = await (service as any).hasForked();
+
+    // Should detect the deepest fork at height 101
+    expect(forkedHeader).toBeDefined();
+    expect(forkedHeader.blockHeight).toBe(101);
+    expect(forkedHeader.blockHash).toBe('0xabc101_canonical');
+
+    // Verify that both orphans were detected in logs
+    // We can't directly test logs, but we can verify the behavior
+  });
+
+  it('should only check the last block when comprehensive check is disabled', async () => {
+    // Create service with comprehensive check DISABLED
+    service = await createServiceWithComprehensiveCheck(false, 10);
+    
+    // Start with a reasonable initial tip
+    mockBlockchainService.getBestHeight.mockResolvedValue(100);
+    
+    // Mock the chain's view - orphan at 101, but 105 is correct
+    mockBlockchainService.getHeaderForHeight.mockImplementation(async (height: number) => {
+      if (height === 101) {
+        return mockBlock(101, '0xabc101_canonical', '0xabc100').block.header;
+      }
+      return mockBlock(height, `0xabc${height}`, `0xabc${height - 1}`).block.header;
+    });
+
+    // Process blocks including the orphan
+    await service.processUnfinalizedBlockHeader(mockBlock(100, '0xabc100').block.header);
+    await service.processUnfinalizedBlockHeader(mockBlock(101, '0xabc101_orphan', '0xabc100').block.header); // Orphan!
+    
+    // Process correct blocks sequentially up to 115
+    for (let i = 102; i <= 115; i++) {
+      mockBlockchainService.getBestHeight.mockResolvedValue(i);
+      await service.processUnfinalizedBlockHeader(mockBlock(i, `0xabc${i}`, `0xabc${i-1}`).block.header);
+    }
+
+    // Now trigger fork detection
+    const forkedHeader = await (service as any).hasForked();
+
+    // Should NOT detect the orphan at 101 because it only checks block 105
+    expect(forkedHeader).toBeUndefined();
+  });
+
+  it('should handle the Subspace convergent fork scenario', async () => {
+    // This tests the exact scenario from the user's example
+    service = await createServiceWithComprehensiveCheck(true, 10);
+    
+    const orphanHeight = 3269020;
+    const currentTip = 3269030;
+    
+    // Start with a reasonable initial tip
+    mockBlockchainService.getBestHeight.mockResolvedValue(3269010);
+    
+    // Mock the chain's view where block 3269020 has a different hash
+    mockBlockchainService.getHeaderForHeight.mockImplementation(async (height: number) => {
+      if (height === orphanHeight) {
+        // The canonical version
+        return {
+          blockHeight: orphanHeight,
+          blockHash: '0xd2d3d77d27e03c12f347d88059b033d2b7659b20e84b73e8b38b50d39d2998bf',
+          parentHash: '0xfee1fa6cd69a7b4cc26e1da29dc314a91c6a12ada4ee3984dc6b9802a43c9be9',
+          timestamp: new Date(),
+        };
+      }
+      // Default blocks
+      return mockBlock(height, `0xabc${height}`, `0xabc${height - 1}`).block.header;
+    });
+
+    // Process blocks sequentially including the orphan version
+    for (let i = 3269010; i < orphanHeight; i++) {
+      mockBlockchainService.getBestHeight.mockResolvedValue(i);
+      await service.processUnfinalizedBlockHeader(mockBlock(i, `0xabc${i}`, `0xabc${i-1}`).block.header);
+    }
+    
+    // Process the orphan block (our indexed version)
+    mockBlockchainService.getBestHeight.mockResolvedValue(orphanHeight);
+    await service.processUnfinalizedBlockHeader({
+      blockHeight: orphanHeight,
+      blockHash: '0x81a7d55fd23846b08ed8d7a4c56879ef43f3537332e97d6a4cd7799ba5b742d1',
+      parentHash: '0xabc3269019',
+      timestamp: new Date(),
+    });
+
+    // Process subsequent blocks sequentially
+    for (let i = orphanHeight + 1; i <= currentTip; i++) {
+      mockBlockchainService.getBestHeight.mockResolvedValue(i);
+      await service.processUnfinalizedBlockHeader(mockBlock(i, `0xabc${i}`, `0xabc${i-1}`).block.header);
+    }
+
+    // Now trigger fork detection
+    const forkedHeader = await (service as any).hasForked();
+
+    // Should detect the orphan block
+    expect(forkedHeader).toBeDefined();
+    expect(forkedHeader.blockHeight).toBe(orphanHeight);
+    expect(forkedHeader.blockHash).toBe('0xd2d3d77d27e03c12f347d88059b033d2b7659b20e84b73e8b38b50d39d2998bf');
+  });
+
+  it('should continue checking all blocks even if one RPC call fails', async () => {
+    service = await createServiceWithComprehensiveCheck(true, 10);
+    
+    // Start with initial tip
+    mockBlockchainService.getBestHeight.mockResolvedValue(100);
+    
+    // Mock getHeaderForHeight to fail for block 101 but succeed for others
+    mockBlockchainService.getHeaderForHeight.mockImplementation(async (height: number) => {
+      if (height === 101) {
+        throw new Error('RPC timeout');
+      }
+      if (height === 103) {
+        return mockBlock(103, '0xabc103_canonical', '0xabc102').block.header;
+      }
+      return mockBlock(height, `0xabc${height}`, `0xabc${height - 1}`).block.header;
+    });
+
+    // Add blocks to unfinalized list
+    for (let i = 100; i <= 110; i++) {
+      mockBlockchainService.getBestHeight.mockResolvedValue(i);
+      if (i === 103) {
+        // Add an orphan at 103
+        await service.processUnfinalizedBlockHeader(mockBlock(i, '0xabc103_orphan', `0xabc${i-1}`).block.header);
+      } else {
+        await service.processUnfinalizedBlockHeader(mockBlock(i, `0xabc${i}`, `0xabc${i-1}`).block.header);
+      }
+    }
+
+    // Advance tip to 113 so finalized = 103, which means blocks <= 103 will be checked
+    mockBlockchainService.getBestHeight.mockResolvedValue(113);
+    
+    // Now trigger fork detection by processing another block
+    await service.processUnfinalizedBlockHeader(mockBlock(111, '0xabc111', '0xabc110').block.header);
+
+    // Get the forked header from hasForked
+    const forkedHeader = await (service as any).hasForked();
+
+    // Should still detect the orphan at 103 despite the RPC error at 101
+    expect(forkedHeader).toBeDefined();
+    expect(forkedHeader.blockHeight).toBe(103);
+    expect(forkedHeader.blockHash).toBe('0xabc103_canonical');
+  });
+});
