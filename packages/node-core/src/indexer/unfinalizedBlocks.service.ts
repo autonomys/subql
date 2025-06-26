@@ -283,6 +283,59 @@ export class UnfinalizedBlocksService<B = any> implements IUnfinalizedBlocksServ
         logger.warn('Cannot check for forks; effective finality not yet determined.');
         return undefined;
     }
+    
+    // Check if comprehensive fork detection is enabled (could be a config option)
+    const comprehensiveCheck = this.nodeConfig.comprehensiveForkDetection ?? false;
+    
+    if (comprehensiveCheck) {
+      // NEW: Check ALL blocks that are about to be pruned
+      const blocksToPrune = this.unfinalizedBlocks.filter(
+        ({blockHeight}) => blockHeight <= this.finalizedBlockNumber
+      );
+      
+      if (blocksToPrune.length === 0) {
+        return undefined;
+      }
+      
+      logger.debug(`Comprehensive fork check: verifying ${blocksToPrune.length} blocks before pruning`);
+      
+      let deepestFork: Header | undefined;
+      let deepestForkHeight = Number.MAX_SAFE_INTEGER;
+      let totalForksFound = 0;
+      
+      // Check each block against the chain's view
+      for (const storedBlock of blocksToPrune) {
+        try {
+          const chainHeader = await this.blockchainService.getHeaderForHeight(storedBlock.blockHeight);
+          
+          if (chainHeader.blockHash !== storedBlock.blockHash) {
+            logger.warn(
+              `Orphan block detected at height ${storedBlock.blockHeight}: ` +
+              `stored=${storedBlock.blockHash}, chain=${chainHeader.blockHash}`
+            );
+            
+            totalForksFound++;
+            
+            // Track the deepest (earliest) fork
+            if (storedBlock.blockHeight < deepestForkHeight) {
+              deepestFork = chainHeader;
+              deepestForkHeight = storedBlock.blockHeight;
+            }
+          }
+        } catch (error) {
+          logger.error(`Failed to verify block ${storedBlock.blockHeight}: ${error}`);
+          // Continue checking other blocks
+        }
+      }
+      
+      if (deepestFork) {
+        logger.warn(`Found ${totalForksFound} total fork(s), deepest at height ${deepestForkHeight}. Will rewind to this point.`);
+      }
+      
+      return deepestFork; // Return the deepest fork found
+    }
+    
+    // ORIGINAL LOGIC: Only check the last verifiable block
     const lastVerifiableBlock = this.getClosestRecord(this.finalizedBlockNumber);
 
     // No unfinalized blocks

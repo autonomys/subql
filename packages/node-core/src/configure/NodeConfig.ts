@@ -44,6 +44,7 @@ export interface IConfig {
   readonly reindex?: number;
   readonly unfinalizedBlocks?: boolean;
   readonly finalizedDepth?: number;
+  readonly comprehensiveForkDetection?: boolean;
   readonly pgCa?: string;
   readonly pgKey?: string;
   readonly pgCert?: string;
@@ -95,6 +96,7 @@ const DEFAULT_CONFIG = {
   allowSchemaMigration: false,
   monitorOutDir: './.monitor',
   monitorObjectMaxDepth: 5,
+  comprehensiveForkDetection: false,
 };
 
 export class NodeConfig<C extends IConfig = IConfig> implements IConfig {
@@ -386,6 +388,10 @@ export class NodeConfig<C extends IConfig = IConfig> implements IConfig {
 
   get enableCache(): boolean {
     return this._config.enableCache ?? true;
+  }
+
+  get comprehensiveForkDetection(): boolean | undefined {
+    return this._config.comprehensiveForkDetection;
   }
 
   merge(config: Partial<IConfig>): this {
