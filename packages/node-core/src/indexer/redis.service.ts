@@ -44,6 +44,9 @@ export interface SafeRedisClient {
   zrange: (key: string, start: number, stop: number) => Promise<string[]>;
   zrevrange: (key: string, start: number, stop: number) => Promise<string[]>;
   zcard: (key: string) => Promise<number>;
+  bgsave: () => Promise<string>;
+  lastsave: () => Promise<number>;
+  configGet: (parameter: string) => Promise<string[]>;
 }
 
 @Injectable()
@@ -295,6 +298,18 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
       zcard: async (key: string) => {
         if (!(await this.ensureConnected())) return 0;
         return this.client!.zcard(key);
+      },
+      bgsave: async () => {
+        if (!(await this.ensureConnected())) throw new Error('Redis connection not established');
+        return this.client!.bgsave();
+      },
+      lastsave: async () => {
+        if (!(await this.ensureConnected())) throw new Error('Redis connection not established');
+        return this.client!.lastsave();
+      },
+      configGet: async (parameter: string) => {
+        if (!(await this.ensureConnected())) throw new Error('Redis connection not established');
+        return this.client!.config('GET', parameter) as Promise<string[]>;
       },
     };
   }

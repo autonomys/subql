@@ -42,6 +42,10 @@ export interface SafeRedisClient {
   zrange: (key: string, start: number, stop: number) => Promise<string[]>;
   zrevrange: (key: string, start: number, stop: number) => Promise<string[]>;
   zcard: (key: string) => Promise<number>;
+  // Persistence methods
+  bgsave: () => Promise<string>;
+  lastsave: () => Promise<number>;
+  configGet: (parameter: string) => Promise<string[]>;
 }
 
 // base global
