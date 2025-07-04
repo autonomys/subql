@@ -26,6 +26,7 @@ RUN apk add --no-cache tini curl git redis && \
     tar -xzvf /app.tgz --strip 1 && \
     rm /app.tgz && \
     yarn install --production && \
+    yarn add ioredis && \
     yarn cache clean && \
     rm -rf /root/.npm /root/.cache
 

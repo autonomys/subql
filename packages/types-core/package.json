@@ -16,6 +16,7 @@
     "/dist"
   ],
   "devDependencies": {
+    "ioredis": "^5.6.1",
     "package-json-type": "^1.0.3"
   }
 }

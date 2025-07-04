@@ -9,6 +9,7 @@ import {InMemoryCacheService} from '../inMemoryCache.service';
 import {MonitorService} from '../monitor.service';
 import {SandboxService} from '../sandbox.service';
 import {UnfinalizedBlocksService} from '../unfinalizedBlocks.service';
+import {RedisService} from '../redis.service';
 import {WorkerInMemoryCacheService} from './worker.cache.service';
 import {WorkerConnectionPoolStateManager} from './worker.connectionPoolState.manager';
 import {WorkerDynamicDsService} from './worker.dynamic-ds.service';
@@ -19,6 +20,7 @@ import {WorkerUnfinalizedBlocksService} from './worker.unfinalizedBlocks.service
   providers: [
     ConnectionPoolService,
     SandboxService,
+    RedisService,
     {
       provide: ConnectionPoolStateManager,
       useFactory: () => new WorkerConnectionPoolStateManager((global as any).host),
@@ -47,6 +49,7 @@ import {WorkerUnfinalizedBlocksService} from './worker.unfinalizedBlocks.service
     InMemoryCacheService,
     'IUnfinalizedBlocksService',
     DynamicDsService,
+    RedisService,
   ],
 })
 export class WorkerCoreModule {}
