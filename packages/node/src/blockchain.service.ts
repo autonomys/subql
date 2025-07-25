@@ -9,6 +9,7 @@ import {
   IBlock,
   IBlockchainService,
   mainThreadOnly,
+  getLogger,
 } from '@subql/node-core';
 import {
   SubstrateCustomDatasource,
@@ -38,6 +39,7 @@ import {
   getHeaderForHash,
 } from './utils/substrate';
 
+const logger = getLogger('BlockchainService');
 const BLOCK_TIME_VARIANCE = 5000; //ms
 const INTERVAL_PERCENT = 0.9;
 
@@ -116,6 +118,12 @@ export class BlockchainService
   }
 
   async getBlockTimestamp(height: number): Promise<Date> {
+    // Special handling for genesis block
+    if (height === 0) {
+      logger.debug('Using Unix epoch timestamp for genesis block');
+      return new Date(0);
+    }
+
     const block = await getBlockByHeight(this.apiService.api, height);
 
     let timestamp = getTimestamp(block);

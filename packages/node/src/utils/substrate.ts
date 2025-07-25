@@ -1,6 +1,7 @@
 // Copyright 2020-2025 SubQuery Pte Ltd authors & contributors
 // SPDX-License-Identifier: GPL-3.0
 
+import assert from 'assert';
 import { ApiPromise } from '@polkadot/api';
 import '@polkadot/api-augment/substrate';
 import { Bytes, Option, Vec } from '@polkadot/types';
@@ -28,7 +29,6 @@ import {
   SubstrateEventFilter,
   SubstrateExtrinsic,
 } from '@subql/types';
-import assert from 'assert';
 import { merge } from 'lodash';
 import { SubqlProjectBlockFilter } from '../configure/SubqueryProject';
 import { ApiPromiseConnection } from '../indexer/apiPromise.connection';
@@ -75,8 +75,12 @@ export function wrapBlock(
 }
 
 export function getTimestamp({
-  block: { extrinsics },
+  block: { extrinsics, header },
 }: SignedBlock): Date | undefined {
+  // Genesis block (block 0) typically doesn't have timestamp extrinsics
+  if (header.number.toNumber() === 0) {
+    return new Date(0);
+  }
   // extrinsics can be undefined when fetching light blocks
   if (extrinsics) {
     for (const e of extrinsics) {
@@ -121,7 +125,6 @@ export function wrapExtrinsics(
   const currentBlockNumber = wrappedBlock.block.header.number.toNumber();
   // console.log(`[DEBUG] wrapExtrinsics: Processing block: ${currentBlockNumber}`);
   // console.log(`[DEBUG] wrapExtrinsics: Received allEvents.length: ${allEvents.length}`);
-
 
   const groupedEvents = groupEventsByExtrinsic(allEvents);
   return wrappedBlock.block.extrinsics.map((extrinsic, idx) => {
@@ -379,8 +382,10 @@ export async function fetchEventsRange(
   return Promise.all(
     hashs.map(async (hash) => {
       try {
-        const blockNumber = (await api.rpc.chain.getHeader(hash)).number.toNumber();
-        
+        const blockNumber = (
+          await api.rpc.chain.getHeader(hash)
+        ).number.toNumber();
+
         // Try the standard events query
         try {
           const events = await api.query.system.events.at(hash);
@@ -391,71 +396,94 @@ export async function fetchEventsRange(
         } catch (standardErr) {
           // console.log(`[DEBUG] Block ${blockNumber}: Standard events query failed, trying segmented approach`);
         }
-        
+
         // Fall back to segmented events approach
-        let eventsForBlock: Vec<EventRecord> = api.registry.createType('Vec<EventRecord>');
+        let eventsForBlock: Vec<EventRecord> =
+          api.registry.createType('Vec<EventRecord>');
         let allEvents: EventRecord[] = [];
-        
+
         try {
           // Get total event count for this block
           const totalEventCount = await api.query.system.eventCount.at(hash);
           // @ts-ignore - Handle potential Codec type
-          const eventCount = totalEventCount && totalEventCount.toNumber ? totalEventCount.toNumber() : 0;
-          
+          const eventCount =
+            totalEventCount && totalEventCount.toNumber
+              ? totalEventCount.toNumber()
+              : 0;
+
           if (eventCount > 0) {
             // console.log(`[DEBUG] Block ${blockNumber} has ${eventCount} events (using segmented approach)`);
-            
+
             // Calculate number of segments to check (EventSegmentSize = 100)
             const SEGMENT_SIZE = 100;
             const numSegments = Math.ceil(eventCount / SEGMENT_SIZE);
-            
+
             // Fetch events from all segments
-            for (let segmentIndex = 0; segmentIndex < numSegments; segmentIndex++) {
-              const segmentData = await api.query.system.eventSegments.at(hash, segmentIndex);
-              
+            for (
+              let segmentIndex = 0;
+              segmentIndex < numSegments;
+              segmentIndex++
+            ) {
+              const segmentData = await api.query.system.eventSegments.at(
+                hash,
+                segmentIndex,
+              );
+
               if (!segmentData) continue;
-              
+
               let eventsInSegment: EventRecord[] = [];
-              
+
               // Handle potential Option wrapping
               // @ts-ignore - Types are handled at runtime
-              if (segmentData.isSome !== undefined && typeof segmentData.unwrap === 'function') {
+              if (
+                segmentData.isSome !== undefined &&
+                typeof segmentData.unwrap === 'function'
+              ) {
                 // @ts-ignore
                 if (segmentData.isNone) continue;
                 // @ts-ignore
                 const unwrapped = segmentData.unwrap();
                 // @ts-ignore
                 eventsInSegment = unwrapped.toArray ? unwrapped.toArray() : [];
-              } 
+              }
               // @ts-ignore
               else if (segmentData.toArray !== undefined) {
                 // @ts-ignore
                 eventsInSegment = segmentData.toArray();
               }
-              
+
               if (eventsInSegment.length > 0) {
                 // console.log(`[DEBUG] Found ${eventsInSegment.length} events in segment ${segmentIndex}`);
                 allEvents = allEvents.concat(eventsInSegment);
               }
             }
-            
+
             if (allEvents.length > 0) {
               // console.log(`[DEBUG] Total events collected: ${allEvents.length} (expected ${eventCount})`);
-              eventsForBlock = api.registry.createType('Vec<EventRecord>', allEvents);
+              eventsForBlock = api.registry.createType(
+                'Vec<EventRecord>',
+                allEvents,
+              );
             }
           }
         } catch (err) {
           // Both approaches failed, log warning
-          logger.warn(`Failed to fetch events for block ${blockNumber} using both standard and segmented approaches`);
+          logger.warn(
+            `Failed to fetch events for block ${blockNumber} using both standard and segmented approaches`,
+          );
         }
-        
+
         return eventsForBlock;
       } catch (e: any) {
         let blockNumForError = 'unknown';
-        try { 
-          blockNumForError = (await api.rpc.chain.getHeader(hash)).number.toString(); 
-        } catch (_) {}
-        
+        try {
+          blockNumForError = (
+            await api.rpc.chain.getHeader(hash)
+          ).number.toString();
+        } catch (_) {
+          // Intentionally empty - we'll use 'unknown' as the block number in the error message
+        }
+
         logger.error(
           `failed to fetch events at block ${hash} (Number: ${blockNumForError})${getApiDecodeErrMsg(
             e.message,
