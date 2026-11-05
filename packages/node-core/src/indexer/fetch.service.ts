@@ -31,6 +31,7 @@ export class FetchService<DS extends BaseDataSource, B extends IBlockDispatcher<
 {
   private _latestBestHeight?: number;
   private _latestFinalizedHeight?: number;
+  private _latestDepthFinalizedHeight?: number;
   private isShutdown = false;
 
   constructor(
@@ -57,6 +58,14 @@ export class FetchService<DS extends BaseDataSource, B extends IBlockDispatcher<
     return this._latestFinalizedHeight;
   }
 
+  // The highest block treated as final when unfinalized blocks are disabled
+  private get finalizedTargetHeight(): number {
+    if (this._latestDepthFinalizedHeight === undefined) {
+      return this.latestFinalizedHeight;
+    }
+    return Math.max(this.latestFinalizedHeight, this._latestDepthFinalizedHeight);
+  }
+
   protected getModulos(dataSources: DS[]): number[] {
     return getModulos(dataSources, this.blockchainSevice.isCustomDs, this.blockchainSevice.blockHandlerKind);
   }
@@ -72,6 +81,8 @@ export class FetchService<DS extends BaseDataSource, B extends IBlockDispatcher<
   }
 
   async init(startHeight: number): Promise<void> {
+    this.checkFinalizedDepthTarget();
+
     const interval = await this.blockchainSevice.getChainInterval();
 
     await Promise.all([this.getFinalizedBlockHead(), this.getBestBlockHead()]);
@@ -111,6 +122,28 @@ export class FetchService<DS extends BaseDataSource, B extends IBlockDispatcher<
     void this.startLoop(startHeight);
   }
 
+  private checkFinalizedDepthTarget(): void {
+    if (!this.nodeConfig.fetchToFinalizedDepth) return;
+
+    const depth = this.nodeConfig.finalizedDepth;
+    if (depth === undefined || !Number.isInteger(depth) || depth <= 0) {
+      throw new Error(
+        `--fetch-to-finalized-depth requires --finalized-depth to be a positive whole number of blocks, received: ${depth}`
+      );
+    }
+
+    if (this.nodeConfig.unfinalizedBlocks) {
+      logger.warn(
+        '--fetch-to-finalized-depth has no effect because unfinalized blocks are enabled, the fetch target is the best height'
+      );
+      return;
+    }
+
+    logger.info(
+      `Fetch target is the best height minus ${depth} blocks, or the chain-reported finalized height if that is higher`
+    );
+  }
+
   private updateDictionary(): void {
     return this.dictionaryService.buildDictionaryEntryMap(this.projectService.getDataSourcesMap());
   }
@@ -127,9 +160,7 @@ export class FetchService<DS extends BaseDataSource, B extends IBlockDispatcher<
         this._latestFinalizedHeight = currentFinalizedHeader.blockHeight;
         this.unfinalizedBlocksService.registerFinalizedBlock(currentFinalizedHeader);
         if (!this.nodeConfig.unfinalizedBlocks) {
-          this.eventEmitter.emit(IndexerEvent.BlockTarget, {
-            height: this.latestFinalizedHeight,
-          });
+          this.emitFinalizedTarget();
         }
       }
     } catch (e: any) {
@@ -150,6 +181,8 @@ export class FetchService<DS extends BaseDataSource, B extends IBlockDispatcher<
           this.eventEmitter.emit(IndexerEvent.BlockTarget, {
             height: this.latestBestHeight,
           });
+        } else if (this.nodeConfig.fetchToFinalizedDepth) {
+          this.updateDepthFinalizedHeight(currentBestHeight);
         }
       }
     } catch (e: any) {
@@ -157,12 +190,37 @@ export class FetchService<DS extends BaseDataSource, B extends IBlockDispatcher<
     }
   }
 
+  private updateDepthFinalizedHeight(bestHeight: number): void {
+    const depth = this.nodeConfig.finalizedDepth;
+    assert(depth !== undefined && depth > 0, 'Finalized depth is required for the depth finalized target');
+    const depthFinalizedHeight = bestHeight - depth;
+    // The best height can go backwards, e.g. when RPC endpoints disagree, but the target should not
+    if (this._latestDepthFinalizedHeight !== undefined && depthFinalizedHeight <= this._latestDepthFinalizedHeight) {
+      return;
+    }
+    this._latestDepthFinalizedHeight = depthFinalizedHeight;
+    this.emitFinalizedTarget();
+  }
+
+  private emitFinalizedTarget(): void {
+    // At startup the finalized and best heights arrive in either order, emit once both parts of the target are known
+    if (
+      this._latestFinalizedHeight === undefined ||
+      (this.nodeConfig.fetchToFinalizedDepth && this._latestDepthFinalizedHeight === undefined)
+    ) {
+      return;
+    }
+    this.eventEmitter.emit(IndexerEvent.BlockTarget, {
+      height: this.finalizedTargetHeight,
+    });
+  }
+
   private async startLoop(initBlockHeight: number): Promise<void> {
     await this.fillNextBlockBuffer(initBlockHeight);
   }
 
   private latestHeight(): number {
-    return this.nodeConfig.unfinalizedBlocks ? this.latestBestHeight : this.latestFinalizedHeight;
+    return this.nodeConfig.unfinalizedBlocks ? this.latestBestHeight : this.finalizedTargetHeight;
   }
 
   // eslint-disable-next-line complexity
@@ -372,14 +430,15 @@ export class FetchService<DS extends BaseDataSource, B extends IBlockDispatcher<
 
   private nextEndBlockHeight(startBlockHeight: number, scaledBatchSize: number): number {
     let endBlockHeight = startBlockHeight + scaledBatchSize - 1;
+    const finalizedHeight = this.finalizedTargetHeight;
 
-    if (endBlockHeight > this.latestFinalizedHeight) {
+    if (endBlockHeight > finalizedHeight) {
       if (this.nodeConfig.unfinalizedBlocks) {
         if (endBlockHeight >= this.latestBestHeight) {
           endBlockHeight = this.latestBestHeight;
         }
       } else {
-        endBlockHeight = this.latestFinalizedHeight;
+        endBlockHeight = finalizedHeight;
       }
     }
     return endBlockHeight;

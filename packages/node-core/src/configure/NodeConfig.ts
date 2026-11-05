@@ -44,6 +44,7 @@ export interface IConfig {
   readonly reindex?: number;
   readonly unfinalizedBlocks?: boolean;
   readonly finalizedDepth?: number;
+  readonly fetchToFinalizedDepth?: boolean;
   readonly comprehensiveForkDetection?: boolean;
   readonly pgCa?: string;
   readonly pgKey?: string;
@@ -300,6 +301,10 @@ export class NodeConfig<C extends IConfig = IConfig> implements IConfig {
 
   get finalizedDepth(): number | undefined {
     return this._config.finalizedDepth;
+  }
+
+  get fetchToFinalizedDepth(): boolean {
+    return this._config.fetchToFinalizedDepth ?? false;
   }
 
   get isPostgresSecureConnection(): boolean {
