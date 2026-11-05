@@ -115,6 +115,12 @@ export function yargsBuilder<
                   'Number of blocks behind the chain tip to consider as finalized for indexing, overriding native chain finality. Use with caution.',
                 type: 'number',
               },
+              'fetch-to-finalized-depth': {
+                demandOption: false,
+                describe:
+                  'When unfinalized blocks are disabled, index up to (best height - finalized-depth) instead of the chain-reported finalized height. Requires --finalized-depth. Has no effect when unfinalized blocks are enabled.',
+                type: 'boolean',
+              },
               historical: {
                 describe: 'Enable historical state entities, ',
                 type: 'string',

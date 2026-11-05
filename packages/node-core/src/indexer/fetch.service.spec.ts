@@ -22,6 +22,9 @@ import {
   MultiChainRewindStatus,
   reindex,
   getLogger,
+  IConfig,
+  IndexerEvent,
+  TargetBlockPayload,
 } from '../';
 import {BlockHeightMap} from '../utils/blockHeightMap';
 import {DictionaryService} from './dictionary/dictionary.service';
@@ -233,6 +236,8 @@ describe('Fetch Service', () => {
   let blockchainService: TestBlockchainService;
   const multichainRewindService: MultiChainRewindService = {} as MultiChainRewindService;
   let projectService: IProjectService<any>;
+  let eventEmitter: EventEmitter2;
+  let schedulerRegistry: SchedulerRegistry;
 
   let spyOnEnqueueSequential: jest.SpyInstance<
     void | Promise<void>,
@@ -243,11 +248,29 @@ describe('Fetch Service', () => {
     [heights: (number | IBlock<any>)[], lastBufferedHeight: number]
   >;
 
+  const createFetchService = (config: NodeConfig) =>
+    new TestFetchService(
+      config,
+      projectService,
+      blockDispatcher,
+      dictionaryService,
+      eventEmitter,
+      schedulerRegistry,
+      unfinalizedBlocksService,
+      {
+        metadata: {
+          set: jest.fn(),
+        },
+      } as any,
+      blockchainService,
+      multichainRewindService
+    );
+
   beforeEach(() => {
     dataSources = [mockDs];
 
-    const eventEmitter = new EventEmitter2();
-    const schedulerRegistry = new SchedulerRegistry();
+    eventEmitter = new EventEmitter2();
+    schedulerRegistry = new SchedulerRegistry();
 
     projectService = {
       getStartBlockFromDataSources: jest.fn(() => Math.min(...dataSources.map((ds) => ds.startBlock ?? 0))),
@@ -274,22 +297,7 @@ describe('Fetch Service', () => {
       registerFinalizedBlock: jest.fn(),
     } as unknown as UnfinalizedBlocksService;
 
-    fetchService = new TestFetchService(
-      nodeConfig,
-      projectService,
-      blockDispatcher,
-      dictionaryService,
-      eventEmitter,
-      schedulerRegistry,
-      unfinalizedBlocksService,
-      {
-        metadata: {
-          set: jest.fn(),
-        },
-      } as any,
-      blockchainService,
-      multichainRewindService
-    );
+    fetchService = createFetchService(nodeConfig);
 
     spyOnEnqueueSequential = jest.spyOn(fetchService as any, 'enqueueSequential') as any;
     enqueueBlocksSpy = jest.spyOn(blockDispatcher, 'enqueueBlocks');
@@ -824,5 +832,117 @@ describe('Fetch Service', () => {
     (multichainRewindService as any).status = MultiChainRewindStatus.Complete;
     await fetchService.init(10);
     expect(consoleSpy).toHaveBeenCalledWith(expect.stringMatching(/Waiting for all chains to complete rewind/));
+  });
+
+  describe('fetch target', () => {
+    const FINALIZED_DEPTH = 100;
+
+    let targets: number[];
+
+    const configWith = (config: Partial<IConfig>) =>
+      new NodeConfig({
+        subquery: '',
+        batchSize: 10,
+        unfinalizedBlocks: false,
+        networkDictionary: [''],
+        finalizedDepth: FINALIZED_DEPTH,
+        ...config,
+      });
+
+    const waitForChainHeadPoll = () => delay((CHAIN_INTERVAL / 1000) * 1.5);
+
+    beforeEach(() => {
+      (multichainRewindService as any).status = undefined;
+      blockchainService.finalizedHeight = 1000;
+      blockchainService.bestHeight = 5000;
+      targets = [];
+      eventEmitter.on(IndexerEvent.BlockTarget, ({height}: TargetBlockPayload) => targets.push(height));
+    });
+
+    it('targets the chain-reported finalized height by default, even with a finalized depth', async () => {
+      fetchService = createFetchService(configWith({}));
+
+      await fetchService.init(995);
+      expect(enqueueBlocksSpy).toHaveBeenLastCalledWith([995, 996, 997, 998, 999, 1000], 1000);
+
+      blockchainService.bestHeight = 5050;
+      await waitForChainHeadPoll();
+      blockDispatcher.freeSize = 10;
+      await delay(1);
+
+      expect(enqueueBlocksSpy).toHaveBeenCalledTimes(1);
+      expect(targets).toEqual([1000]);
+    });
+
+    it('targets the best height minus the finalized depth with fetchToFinalizedDepth', async () => {
+      fetchService = createFetchService(configWith({fetchToFinalizedDepth: true}));
+
+      // Above the chain-reported finalized height, which throws without fetchToFinalizedDepth
+      await fetchService.init(4895);
+
+      expect(enqueueBlocksSpy).toHaveBeenLastCalledWith([4895, 4896, 4897, 4898, 4899, 4900], 4900);
+      expect(targets).toEqual([4900]);
+    });
+
+    it('advances the target with the best height while the chain-reported finalized height is unchanged', async () => {
+      fetchService = createFetchService(configWith({fetchToFinalizedDepth: true}));
+      const registerFinalizedSpy = jest.spyOn(unfinalizedBlocksService, 'registerFinalizedBlock');
+
+      await fetchService.init(4895);
+      expect(enqueueBlocksSpy).toHaveBeenLastCalledWith([4895, 4896, 4897, 4898, 4899, 4900], 4900);
+
+      blockchainService.bestHeight = 5005;
+      await waitForChainHeadPoll();
+      expect(targets).toEqual([4900, 4905]);
+
+      blockDispatcher.freeSize = 10;
+      await delay(1);
+      expect(enqueueBlocksSpy).toHaveBeenLastCalledWith([4901, 4902, 4903, 4904, 4905], 4905);
+
+      // The raw finalized height was only registered once, at startup
+      expect(registerFinalizedSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not target below the chain-reported finalized height', async () => {
+      blockchainService.bestHeight = 1050;
+      fetchService = createFetchService(configWith({fetchToFinalizedDepth: true}));
+
+      await fetchService.init(995);
+
+      expect(enqueueBlocksSpy).toHaveBeenLastCalledWith([995, 996, 997, 998, 999, 1000], 1000);
+      expect(targets).toEqual([1000]);
+    });
+
+    it('does not move the target back when the best height goes back', async () => {
+      fetchService = createFetchService(configWith({fetchToFinalizedDepth: true}));
+      await fetchService.init(4895);
+
+      blockchainService.bestHeight = 4950;
+      await fetchService.getBestBlockHead();
+      blockchainService.bestHeight = 5001;
+      await fetchService.getBestBlockHead();
+
+      expect(targets).toEqual([4900, 4901]);
+    });
+
+    it.each([false, true])(
+      'targets the best height when unfinalized blocks are enabled, fetchToFinalizedDepth %s',
+      async (fetchToFinalizedDepth) => {
+        fetchService = createFetchService(configWith({unfinalizedBlocks: true, fetchToFinalizedDepth}));
+
+        await fetchService.init(4995);
+
+        expect(enqueueBlocksSpy).toHaveBeenLastCalledWith([4995, 4996, 4997, 4998, 4999, 5000], 5000);
+        expect(targets).toEqual([5000]);
+      }
+    );
+
+    it.each([undefined, 0, -1, 1.5])('rejects fetchToFinalizedDepth with a finalized depth of %s', async (depth) => {
+      fetchService = createFetchService(configWith({fetchToFinalizedDepth: true, finalizedDepth: depth}));
+
+      await expect(fetchService.init(995)).rejects.toThrow(
+        `--fetch-to-finalized-depth requires --finalized-depth to be a positive whole number of blocks, received: ${depth}`
+      );
+    });
   });
 });
